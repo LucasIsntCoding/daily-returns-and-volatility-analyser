@@ -1,6 +1,6 @@
 # Multi-Source Financial Time Series Analyser
 
-A unified Python framework for analyzing financial time series across **Yahoo Finance**, **Alpha Vantage**, and **Binance**. This project standardizes market data from multiple providers into a single analytics pipeline for computing returns, volatility, risk-adjusted performance, tail-risk metrics, and comparative asset diagnostics.
+A unified Python framework for analysing financial time series across **Yahoo Finance**, **Alpha Vantage**, and **Binance**. This project standardizes market data from multiple providers into a single analytics pipeline for computing returns, volatility, risk-adjusted performance, tail-risk metrics, and comparative asset diagnostics.
 
 ## Overview
 
