@@ -1,0 +1,568 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Optional, Sequence, Literal
+import math
+import time
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import requests
+import yfinance as yf
+
+
+# =========================
+# Configuration / Constants
+# =========================
+
+TRADING_DAYS = 252
+BINANCE_BASE_URL = "https://api.binance.com"
+ALPHA_VANTAGE_BASE_URL = "https://www.alphavantage.co/query"
+
+DataSource = Literal["yahoo", "alpha_vantage", "binance"]
+
+
+@dataclass
+class MarketDataConfig:
+    source: DataSource
+    alpha_vantage_api_key: Optional[str] = None
+    timeout_seconds: int = 20
+    max_retries: int = 3
+
+
+# =========================
+# Data Loader
+# =========================
+
+class MarketDataLoader:
+    """
+    Unified loader for Yahoo Finance, Alpha Vantage, and Binance.
+    All loaders return a DataFrame indexed by datetime, with one column per asset
+    containing close prices.
+    """
+
+    def __init__(self, config: MarketDataConfig):
+        self.config = config
+        self.session = requests.Session()
+
+    def get_prices(
+        self,
+        tickers: Sequence[str],
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        interval: str = "1d",
+    ) -> pd.DataFrame:
+        if not tickers:
+            raise ValueError("At least one ticker/symbol must be provided.")
+
+        if self.config.source == "yahoo":
+            return self._get_yahoo_prices(tickers, start, end, interval)
+        if self.config.source == "alpha_vantage":
+            return self._get_alpha_vantage_prices(tickers)
+        if self.config.source == "binance":
+            return self._get_binance_prices(tickers, interval=interval)
+
+        raise ValueError(f"Unsupported source: {self.config.source}")
+
+    def _request_json(self, url: str, params: dict) -> dict | list:
+        last_error = None
+        for attempt in range(self.config.max_retries):
+            try:
+                response = self.session.get(
+                    url,
+                    params=params,
+                    timeout=self.config.timeout_seconds,
+                )
+                response.raise_for_status()
+                return response.json()
+            except Exception as e:
+                last_error = e
+                if attempt < self.config.max_retries - 1:
+                    time.sleep(1.5 * (attempt + 1))
+        raise RuntimeError(f"Request failed after retries: {last_error}")
+
+    # -------- Yahoo Finance --------
+    def _get_yahoo_prices(
+        self,
+        tickers: Sequence[str],
+        start: Optional[str],
+        end: Optional[str],
+        interval: str,
+    ) -> pd.DataFrame:
+        data = yf.download(
+            tickers=list(tickers),
+            start=start,
+            end=end,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            group_by="column",
+        )
+
+        if data.empty:
+            raise ValueError("No Yahoo Finance data returned.")
+
+        if isinstance(data.columns, pd.MultiIndex):
+            if "Close" not in data.columns.get_level_values(0):
+                raise ValueError("Yahoo Finance result missing 'Close' column.")
+            prices = data["Close"].copy()
+        else:
+            if "Close" not in data.columns:
+                raise ValueError("Yahoo Finance result missing 'Close' column.")
+            prices = data[["Close"]].copy()
+            prices.columns = [tickers[0]]
+
+        if isinstance(prices, pd.Series):
+            prices = prices.to_frame(name=tickers[0])
+
+        return self._clean_price_frame(prices)
+
+    # -------- Alpha Vantage --------
+    def _get_alpha_vantage_prices(self, tickers: Sequence[str]) -> pd.DataFrame:
+        if not self.config.alpha_vantage_api_key:
+            raise ValueError("Alpha Vantage requires an API key.")
+
+        frames = []
+
+        for symbol in tickers:
+            params = {
+                "function": "TIME_SERIES_DAILY_ADJUSTED",
+                "symbol": symbol,
+                "outputsize": "full",
+                "apikey": self.config.alpha_vantage_api_key,
+            }
+            payload = self._request_json(ALPHA_VANTAGE_BASE_URL, params)
+
+            if not isinstance(payload, dict):
+                raise ValueError(f"Unexpected Alpha Vantage response for {symbol}: {payload}")
+
+            if "Note" in payload:
+                raise RuntimeError(
+                    f"Alpha Vantage rate-limit/info message for {symbol}: {payload['Note']}"
+                )
+            if "Error Message" in payload:
+                raise RuntimeError(
+                    f"Alpha Vantage error for {symbol}: {payload['Error Message']}"
+                )
+
+            # Expected key: "Time Series (Daily)"
+            ts_key = next((k for k in payload.keys() if "Time Series" in k), None)
+            if ts_key is None:
+                raise ValueError(f"Could not find time series in Alpha Vantage response for {symbol}")
+
+            ts = payload[ts_key]
+            df = pd.DataFrame.from_dict(ts, orient="index")
+            df.index = pd.to_datetime(df.index)
+            df = df.sort_index()
+
+            # Use adjusted close if available
+            close_col = "5. adjusted close" if "5. adjusted close" in df.columns else "4. close"
+            series = pd.to_numeric(df[close_col], errors="coerce").rename(symbol)
+            frames.append(series)
+
+        prices = pd.concat(frames, axis=1)
+        return self._clean_price_frame(prices)
+
+    # -------- Binance --------
+    def _get_binance_prices(
+        self,
+        tickers: Sequence[str],
+        interval: str = "1d",
+        limit: int = 1000,
+    ) -> pd.DataFrame:
+        frames = []
+
+        for symbol in tickers:
+            params = {
+                "symbol": symbol,
+                "interval": interval,
+                "limit": limit,
+            }
+            payload = self._request_json(f"{BINANCE_BASE_URL}/api/v3/klines", params)
+
+            if not isinstance(payload, list) or len(payload) == 0:
+                raise ValueError(f"No Binance kline data returned for {symbol}")
+
+            df = pd.DataFrame(
+                payload,
+                columns=[
+                    "open_time",
+                    "open",
+                    "high",
+                    "low",
+                    "close",
+                    "volume",
+                    "close_time",
+                    "quote_asset_volume",
+                    "number_of_trades",
+                    "taker_buy_base_asset_volume",
+                    "taker_buy_quote_asset_volume",
+                    "ignore",
+                ],
+            )
+
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True).dt.tz_localize(None)
+            df["close"] = pd.to_numeric(df["close"], errors="coerce")
+            series = df.set_index("open_time")["close"].rename(symbol)
+            frames.append(series)
+
+        prices = pd.concat(frames, axis=1)
+        return self._clean_price_frame(prices)
+
+    @staticmethod
+    def _clean_price_frame(prices: pd.DataFrame) -> pd.DataFrame:
+        prices = prices.copy()
+        prices = prices.sort_index()
+        prices = prices.dropna(how="all")
+        prices = prices.ffill()
+        prices = prices.dropna(how="all")
+
+        if prices.empty:
+            raise ValueError("Price frame is empty after cleaning.")
+
+        return prices
+
+
+# =========================
+# Analytics
+# =========================
+
+def arithmetic_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return prices.pct_change().dropna(how="all")
+
+
+def log_returns(prices: pd.DataFrame) -> pd.DataFrame:
+    return np.log(prices / prices.shift(1)).dropna(how="all")
+
+
+def cumulative_returns(simple_returns: pd.DataFrame) -> pd.DataFrame:
+    return (1.0 + simple_returns).cumprod() - 1.0
+
+
+def annualized_return(simple_returns: pd.DataFrame, periods_per_year: int = TRADING_DAYS) -> pd.Series:
+    n = len(simple_returns)
+    if n == 0:
+        return pd.Series(index=simple_returns.columns, dtype=float)
+
+    total_growth = (1.0 + simple_returns).prod()
+    years = n / periods_per_year
+    return total_growth ** (1 / years) - 1.0
+
+
+def annualized_volatility(simple_returns: pd.DataFrame, periods_per_year: int = TRADING_DAYS) -> pd.Series:
+    return simple_returns.std() * math.sqrt(periods_per_year)
+
+
+def rolling_volatility(
+    simple_returns: pd.DataFrame,
+    window: int = 21,
+    periods_per_year: int = TRADING_DAYS,
+) -> pd.DataFrame:
+    return simple_returns.rolling(window).std() * math.sqrt(periods_per_year)
+
+
+def drawdown_series(simple_returns: pd.DataFrame) -> pd.DataFrame:
+    wealth = (1.0 + simple_returns).cumprod()
+    running_peak = wealth.cummax()
+    return wealth / running_peak - 1.0
+
+
+def max_drawdown(simple_returns: pd.DataFrame) -> pd.Series:
+    return drawdown_series(simple_returns).min()
+
+
+def downside_deviation(
+    simple_returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+) -> pd.Series:
+    daily_rf = risk_free_rate / periods_per_year
+    excess = simple_returns - daily_rf
+    downside = excess.where(excess < 0, 0.0)
+    return np.sqrt((downside ** 2).mean()) * math.sqrt(periods_per_year)
+
+
+def sharpe_ratio(
+    simple_returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+) -> pd.Series:
+    daily_rf = risk_free_rate / periods_per_year
+    excess = simple_returns - daily_rf
+    ann_excess_return = excess.mean() * periods_per_year
+    ann_vol = excess.std() * math.sqrt(periods_per_year)
+    return ann_excess_return / ann_vol.replace(0, np.nan)
+
+
+def sortino_ratio(
+    simple_returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+) -> pd.Series:
+    daily_rf = risk_free_rate / periods_per_year
+    excess = simple_returns - daily_rf
+    ann_excess_return = excess.mean() * periods_per_year
+    dd = downside_deviation(simple_returns, risk_free_rate, periods_per_year)
+    return ann_excess_return / dd.replace(0, np.nan)
+
+
+def rolling_sharpe(
+    simple_returns: pd.DataFrame,
+    window: int = 63,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+) -> pd.DataFrame:
+    daily_rf = risk_free_rate / periods_per_year
+    excess = simple_returns - daily_rf
+
+    rolling_mean = excess.rolling(window).mean() * periods_per_year
+    rolling_std = excess.rolling(window).std() * math.sqrt(periods_per_year)
+    return rolling_mean / rolling_std.replace(0, np.nan)
+
+
+def historical_var(
+    simple_returns: pd.DataFrame,
+    alpha: float = 0.05,
+) -> pd.Series:
+    """
+    Historical Value at Risk (left-tail quantile).
+    Example: alpha=0.05 gives 5% VaR.
+    """
+    return simple_returns.quantile(alpha)
+
+
+def historical_cvar(
+    simple_returns: pd.DataFrame,
+    alpha: float = 0.05,
+) -> pd.Series:
+    """
+    Historical Conditional VaR (Expected Shortfall).
+    """
+    var = historical_var(simple_returns, alpha)
+    cvar = {}
+    for col in simple_returns.columns:
+        tail = simple_returns[col][simple_returns[col] <= var[col]]
+        cvar[col] = tail.mean() if not tail.empty else np.nan
+    return pd.Series(cvar)
+
+
+def correlation_matrix(simple_returns: pd.DataFrame) -> pd.DataFrame:
+    return simple_returns.corr()
+
+
+def performance_summary(
+    simple_returns: pd.DataFrame,
+    risk_free_rate: float = 0.0,
+    periods_per_year: int = TRADING_DAYS,
+    var_alpha: float = 0.05,
+) -> pd.DataFrame:
+    summary = pd.DataFrame(index=simple_returns.columns)
+
+    summary["Total Return"] = (1.0 + simple_returns).prod() - 1.0
+    summary["Annualized Return"] = annualized_return(simple_returns, periods_per_year)
+    summary["Annualized Volatility"] = annualized_volatility(simple_returns, periods_per_year)
+    summary["Sharpe Ratio"] = sharpe_ratio(simple_returns, risk_free_rate, periods_per_year)
+    summary["Sortino Ratio"] = sortino_ratio(simple_returns, risk_free_rate, periods_per_year)
+    summary["Max Drawdown"] = max_drawdown(simple_returns)
+    summary[f"VaR ({int(var_alpha * 100)}%)"] = historical_var(simple_returns, var_alpha)
+    summary[f"CVaR ({int(var_alpha * 100)}%)"] = historical_cvar(simple_returns, var_alpha)
+
+    return summary
+
+
+# =========================
+# Plotting
+# =========================
+
+def plot_prices(prices: pd.DataFrame) -> None:
+    plt.figure(figsize=(12, 6))
+    for col in prices.columns:
+        plt.plot(prices.index, prices[col], label=col)
+    plt.title("Price Series")
+    plt.xlabel("Date")
+    plt.ylabel("Price")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_cumulative_returns(cum_returns: pd.DataFrame) -> None:
+    plt.figure(figsize=(12, 6))
+    for col in cum_returns.columns:
+        plt.plot(cum_returns.index, cum_returns[col], label=col)
+    plt.title("Cumulative Returns")
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Return")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_rolling_volatility(roll_vol: pd.DataFrame, window: int) -> None:
+    plt.figure(figsize=(12, 6))
+    for col in roll_vol.columns:
+        plt.plot(roll_vol.index, roll_vol[col], label=col)
+    plt.title(f"Rolling Annualized Volatility ({window}-Period Window)")
+    plt.xlabel("Date")
+    plt.ylabel("Volatility")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_rolling_sharpe(roll_sharpe: pd.DataFrame, window: int) -> None:
+    plt.figure(figsize=(12, 6))
+    for col in roll_sharpe.columns:
+        plt.plot(roll_sharpe.index, roll_sharpe[col], label=col)
+    plt.title(f"Rolling Sharpe Ratio ({window}-Period Window)")
+    plt.xlabel("Date")
+    plt.ylabel("Sharpe Ratio")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_drawdowns(dd: pd.DataFrame) -> None:
+    plt.figure(figsize=(12, 6))
+    for col in dd.columns:
+        plt.plot(dd.index, dd[col], label=col)
+    plt.title("Drawdown Series")
+    plt.xlabel("Date")
+    plt.ylabel("Drawdown")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_return_histograms(simple_returns: pd.DataFrame, bins: int = 50) -> None:
+    for col in simple_returns.columns:
+        plt.figure(figsize=(10, 5))
+        plt.hist(simple_returns[col].dropna(), bins=bins)
+        plt.title(f"Daily Return Distribution: {col}")
+        plt.xlabel("Return")
+        plt.ylabel("Frequency")
+        plt.tight_layout()
+        plt.show()
+
+
+# =========================
+# Pipeline
+# =========================
+
+def analyze_market_data(
+    source: DataSource,
+    tickers: Sequence[str],
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    interval: str = "1d",
+    alpha_vantage_api_key: Optional[str] = None,
+    risk_free_rate: float = 0.0,
+    volatility_window: int = 21,
+    rolling_sharpe_window: int = 63,
+    var_alpha: float = 0.05,
+    make_plots: bool = True,
+) -> dict[str, pd.DataFrame]:
+    """
+    Unified analysis function for Yahoo, Alpha Vantage, and Binance.
+    """
+
+    config = MarketDataConfig(
+        source=source,
+        alpha_vantage_api_key=alpha_vantage_api_key,
+    )
+    loader = MarketDataLoader(config)
+
+    prices = loader.get_prices(
+        tickers=tickers,
+        start=start,
+        end=end,
+        interval=interval,
+    )
+
+    simple_ret = arithmetic_returns(prices)
+    log_ret = log_returns(prices)
+    cum_ret = cumulative_returns(simple_ret)
+    roll_vol = rolling_volatility(simple_ret, window=volatility_window)
+    roll_sh = rolling_sharpe(
+        simple_ret,
+        window=rolling_sharpe_window,
+        risk_free_rate=risk_free_rate,
+    )
+    dd = drawdown_series(simple_ret)
+    corr = correlation_matrix(simple_ret)
+    summary = performance_summary(
+        simple_ret,
+        risk_free_rate=risk_free_rate,
+        var_alpha=var_alpha,
+    )
+
+    print("\n=== Performance Summary ===")
+    print(summary.round(4))
+
+    print("\n=== Correlation Matrix ===")
+    print(corr.round(4))
+
+    if make_plots:
+        plot_prices(prices)
+        plot_cumulative_returns(cum_ret)
+        plot_rolling_volatility(roll_vol, volatility_window)
+        plot_rolling_sharpe(roll_sh, rolling_sharpe_window)
+        plot_drawdowns(dd)
+        plot_return_histograms(simple_ret)
+
+    return {
+        "prices": prices,
+        "arithmetic_returns": simple_ret,
+        "log_returns": log_ret,
+        "cumulative_returns": cum_ret,
+        "rolling_volatility": roll_vol,
+        "rolling_sharpe": roll_sh,
+        "drawdowns": dd,
+        "correlation": corr,
+        "summary": summary,
+    }
+
+
+# =========================
+# Example Usage
+# =========================
+
+if __name__ == "__main__":
+    # -------------------------
+    # 1) Yahoo Finance example
+    # -------------------------
+    yahoo_results = analyze_market_data(
+        source="yahoo",
+        tickers=["AAPL", "MSFT", "GOOGL"],
+        start="2023-01-01",
+        end="2025-01-01",
+        interval="1d",
+        risk_free_rate=0.04,
+        volatility_window=21,
+        rolling_sharpe_window=63,
+        var_alpha=0.05,
+        make_plots=True,
+    )
+
+    # -------------------------
+    # 2) Alpha Vantage example
+    # -------------------------
+    # alpha_results = analyze_market_data(
+    #     source="alpha_vantage",
+    #     tickers=["MSFT", "AAPL"],
+    #     alpha_vantage_api_key="YOUR_API_KEY_HERE",
+    #     risk_free_rate=0.04,
+    #     make_plots=True,
+    # )
+
+    # -------------------------
+    # 3) Binance example
+    # -------------------------
+    # binance_results = analyze_market_data(
+    #     source="binance",
+    #     tickers=["BTCUSDT", "ETHUSDT"],
+    #     interval="1d",   # can also use 1h, 4h, etc.
+    #     risk_free_rate=0.00,
+    #     make_plots=True,
+    # )
